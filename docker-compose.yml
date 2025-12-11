@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  product-service:
+    build: ./product-service
+    container_name: product-service
+    ports:
+      - "4001:4001"
+    environment:
+      # kan overrides, men vi bruger bare default-porten i koden
+      PORT: 4001
+
+  payment-service:
+    build: ./payment-service
+    container_name: payment-service
+    ports:
+      - "4002:4002"
+    environment:
+      PORT: 4002
+
+  order-service:
+    build: ./order-service
+    container_name: order-service
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: 4000
+
+      # Her overskriver vi URLs, så order-service kan ramme de andre
+      # via service-navne i Docker-netværket, i stedet for 127.0.0.1
+      PRODUCT_SERVICE_URL: http://product-service:4001
+      PAYMENT_SERVICE_URL: http://payment-service:4002
+
+      # Resilience-config (du kan tweake til demo)
+      PAYMENT_TIMEOUT_MS: 2000
+      PAYMENT_MAX_RETRIES: 3
+      PAYMENT_RETRY_DELAY_MS: 500
+
+    depends_on:
+      - product-service
+      - payment-service
