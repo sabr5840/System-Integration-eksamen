@@ -1,247 +1,223 @@
-# System Integration – Resilient Microservice Order System
+# System Integration – Microservice Demo (Order, Product, Payment)
 
-Dette projekt er et lille **microservice-baseret ordersystem** udviklet som eksamensgrundlag til faget **System Integration**.
+Dette projekt er en lille, men fagligt fokuseret microservice-arkitektur, som jeg har bygget til mit eksamensprojekt i Systemintegration. Fokus er især på:
 
-Projektet demonstrerer:
+- Opdeling i små, selvstændige services (product, payment, order)
+- Kommunikation via HTTP/REST mellem services
+- Resilience patterns: **Timeout**, **Retry**, **Circuit Breaker** og **Graceful Degradation**
+- Containerisering med **Docker** og orkestrering med **docker-compose**
+- Enkel API-dokumentation med **Swagger** på order-service
 
-- **Microservice-arkitektur** med klare bounded contexts
-- **Lagdelte services** med tydelig separering af ansvar (config, clients, services, controllers, routes)
-- **Kommunikation via REST/HTTP + JSON**
-- **Resilience patterns**: timeout, retry, circuit breaker og fallback
-- **API-dokumentation med Swagger** (på `order-service`)
-- **Deployment med Docker og docker-compose**
-
-Systemet består af tre selvstændige services:
-
-- `product-service` – håndterer produkter (read-only)
-- `payment-service` – simulerer et ustabilt betalingssystem
-- `order-service` – håndterer ordrer og orkestrerer kald til de andre services
+Projektet er skrevet i **Node.js** med **Express**.
 
 ---
 
-## 1. Arkitektur – overblik
+## Overordnet arkitektur
 
-### 1.1 Microservices og bounded contexts
+Projektet består af tre microservices:
 
-| Service         | Port | Bounded Context / Ansvar                           |
-| --------------- | ---- | -------------------------------------------------- |
-| product-service | 4001 | Produktkatalog – readonly produkter                |
-| payment-service | 4002 | Betaling – simuleret ustabil ekstern afhængighed   |
-| order-service   | 4000 | Ordrer – orkestrering af produkt- og betalingskald |
+1. **product-service (port 4001)**
 
-Hver service kører som en **separat Node.js-applikation** med eget ansvar og kan principielt udvikles, deployes og skaleres uafhængigt.
+   - Står for produkter og priser
+   - Simulerer et lille produktkatalog i memory
 
-`order-service` er den eneste, der kender til begge andre services og fungerer derfor som en **orchestrator**: den koordinerer kald til `product-service` og `payment-service` og implementerer resilience over for fejl i dem.
+2. **payment-service (port 4002)**
 
-### 1.2 Lagdelt arkitektur pr. service
+   - Simulerer en ustabil betalingsudbyder
+   - Bruges til at demonstrere timeout, retry og circuit breaker
 
-Alle services følger (med små variationer) en konsistent struktur:
+3. **order-service (port 4000)**
+   - Orkestrerer hele ordre-flowet
+   - Kalder product-service for at hente produkt
+   - Kalder payment-service med **resilience patterns**
+   - Har **Swagger UI** til at dokumentere API’et
 
-- `src/config` – konfiguration (porte, base-URLs, resilience-indstillinger)
-- `src/routes` – route-definitioner og URL-struktur
-- `src/controllers` – HTTP-lag (validering, mapping mellem HTTP og domæne)
-- `src/services` – domænelogik / forretningsregler
-- `src/clients` – (kun i `order-service`) integrationer til andre services via HTTP
-- `src/docs` – (i `order-service`) Swagger/OpenAPI-definition
-- `src/app.js` – opbygger Express-appen (middleware + routes)
-- `src/index.js` – entrypoint, starter HTTP-serveren
-
-Denne opdeling giver en **klar adskillelse mellem ansvar**:
-
-- _Controllers_ ved, at der findes HTTP og `req`/`res`
-- _Services_ tænker i domæne (“opret ordre”, “hent produkter”)
-- _Clients_ ved, hvordan man taler med andre microservices (HTTP/axios)
-- _Config_ centralt definerer porte, timeouts, URLs osv.
+Alle services kører i hver sin container via `docker-compose`, og order-service kalder de andre services via service-navne på Docker-netværket (`http://product-service:4001`, `http://payment-service:4002`).
 
 ---
 
-## 2. Services i detaljer
+## Teknisk stack
 
-### 2.1 `product-service` (port 4001)
+- **Sprog:** Node.js (ES Modules)
+- **Framework:** Express
+- **HTTP-klient:** Axios (i order-service til kald mod payment- og product-service)
+- **Dokumentation:** swagger-ui-express (Swagger UI)
+- **Containerisering:** Docker + docker-compose
 
-**Ansvar:**  
-Read-only API til et simpelt produktkatalog. Bruges af `order-service`, når der oprettes en ordre.
+---
 
-**Vigtige endpoints:**
+## Services i detaljer
 
-- `GET /health` – simpelt health-check:
+### 1. product-service
 
-  ```json
-  {
-    "status": "ok",
-    "service": "product-service"
+**Formål:**  
+Tilbyder et simpelt produktkatalog med ID, navn og pris. Bruges af order-service til at finde produkt og pris før betaling.
+
+**Port (default):** `4001`
+
+**Vigtigste filer:**
+
+- `src/config/config.js`
+  - Simpel config med port:
+  ```js
+  export const config = {
+    port: process.env.PORT || 4001,
+  };
+  ```
+- `src/services/product.service.js`
+
+  - In-memory liste af produkter:
+
+  ```js
+  const products = [
+    { id: 1, name: "Laptop", price: 9999 },
+    { id: 2, name: "Headphones", price: 799 },
+    { id: 3, name: "Keyboard", price: 499 },
+  ];
+
+  export function listProducts() {
+    return products;
+  }
+
+  export function getProductById(id) {
+    return products.find((p) => p.id === id) || null;
   }
   ```
 
-- `GET /products` – returnerer en statisk liste af produkter:
-
-  ```json
-  [
-    { "id": 1, "name": "Laptop", "price": 9999 },
-    { "id": 2, "name": "Headphones", "price": 799 },
-    { "id": 3, "name": "Keyboard", "price": 499 }
-  ]
-  ```
-
-- `GET /products/:id` – slå ét produkt op via ID:
-
-  ```json
-  {
-    "id": 1,
-    "name": "Laptop",
-    "price": 9999
-  }
-  ```
-
-**Intern struktur (uddrag):**
-
-- `services/product.service.js` – domænelag (liste + opslag)
-- `controllers/product.controller.js` – håndterer HTTP-requests og responses
-- `routes/product.routes.js` – definerer `/products`-routes
-- `routes/index.js` – samler `/health` + `/products`
-- `app.js` + `index.js` – opsætter Express og starter serveren
-
-`product-service` har ingen afhængigheder til andre services og kan ses som en **ren bounded context** omkring produktkataloget.
-
----
-
-### 2.2 `payment-service` (port 4002)
-
-**Ansvar:**  
-Simulerer et **ustabilt betalingssystem**. Formålet er at have en downstream-service, som nogle gange fejler eller er langsom, så vi kan demonstrere resilience patterns i `order-service`.
+- `src/controllers/product.controller.js`
+  - Håndterer HTTP-requests og validering (fx invalid id, ikke fundet).
+- `src/routes/product.routes.js` + `src/routes/index.js`
+  - Router `/products`-endpoints og `/health`.
 
 **Endpoints:**
 
-- `GET /health`:
+- `GET /health`  
+  Health-check: `{ status: "ok", service: "product-service" }`
 
-  ```json
-  {
-    "status": "ok",
-    "service": "payment-service"
+- `GET /products`  
+  Returnerer alle produkter.
+
+- `GET /products/:id`  
+  Returnerer ét produkt.
+  - `400` ved ugyldigt id
+  - `404` hvis produktet ikke findes
+
+---
+
+### 2. payment-service
+
+**Formål:**  
+Simulerer en betalingsudbyder med **tilfældig ustabilitet**, så jeg kan demonstrere:
+
+- Timeouts i order-service
+- Retries
+- 5xx-fejl
+- Hvordan circuit breaker i order-service reagerer
+
+**Port (default):** `4002`
+
+**Vigtigste filer:**
+
+- `src/config/config.js`
+
+  ```js
+  export const config = {
+    port: process.env.PORT || 4002,
+  };
+  ```
+
+- `src/services/payment.service.js`  
+  Her simulerer jeg et ustabilt betalingssystem:
+
+  ```js
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  export async function processPayment({ amount, orderId }) {
+    if (!amount || !orderId) {
+      const error = new Error("amount and orderId are required");
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const random = Math.random();
+    console.log("[payment-service] Incoming payment request", {
+      amount,
+      orderId,
+      random,
+    });
+
+    // 20%: langsom respons – godt til at teste timeout i order-service
+    if (random < 0.2) {
+      console.log("[payment-service] Simulating slow response...");
+      await sleep(5000);
+    }
+
+    // 30%: 500-fejl
+    if (random >= 0.2 && random < 0.5) {
+      console.log("[payment-service] Simulating 500 error");
+      const error = new Error("Payment provider error");
+      error.statusCode = 500;
+      throw error;
+    }
+
+    // Resten: succes
+    console.log("[payment-service] Payment success");
+    return {
+      status: "success",
+      transactionId: `tx-${Date.now()}`,
+      orderId,
+      amount,
+    };
   }
   ```
 
-- `POST /payments` – forsøger at processere en betaling.
+  Derudover tjekker jeg for manglende `amount` og `orderId` og returnerer `400`.
 
-  Request-body:
+- `src/controllers/payment.controller.js`
+  - Pakker `processPayment` ind i en HTTP-handler.
+  - Mapper thrown errors til korrekte HTTP-statuskoder.
 
+**Endpoints:**
+
+- `GET /health`  
+  Health-check for payment-service.
+
+- `POST /payments`  
+  Request body:
   ```json
   {
-    "amount": 100,
+    "amount": 999,
     "orderId": "order-123"
   }
   ```
-
-  Logikken i `services/payment.service.js` gør følgende:
-
-  - ca. 20% af kald: **langsom respons** (simulerer fx langsom tredjeparts-udbyder)  
-    → service sover i ca. 5 sekunder
-  - ca. 30% af kald: **500-fejl** – kaster en fejl med status 500  
-    (simulerer ustabil udbyder)
-  - resten: **success**, fx:
-
-    ```json
-    {
-      "status": "success",
-      "transactionId": "tx-1733740000000",
-      "orderId": "order-123",
-      "amount": 100
-    }
-    ```
-
-`payment-service` fungerer som en **downstream dependency**, der ikke kan stoles 100% på – præcis det, resilience patterns er designet til at håndtere.
+  Responses:
+  - `201` + payment-objekt ved succes
+  - `400` ved manglende/ugyldige felter
+  - `500` ved simuleret provider-fejl
 
 ---
 
-### 2.3 `order-service` (port 4000)
+### 3. order-service
 
-**Ansvar:**  
-Håndterer oprettelse og visning af ordrer og orkestrerer kald til `product-service` og `payment-service`.
+**Formål:**  
+Order-service binder det hele sammen og implementerer **resilience patterns** mod payment-service. Den håndterer:
 
-**Flow for `POST /orders`:**
+1. Hent produkt (via product-service)
+2. Forsøg betaling (via payment-service) med:
+   - Timeout
+   - Retry
+   - Circuit breaker
+3. Fallback (Graceful Degradation), hvis betaling fejler
 
-1. Validerer input (`productId`)
-2. Henter produktet hos `product-service`
-3. Forsøger at oprette betaling hos `payment-service` via en resilient klient
-4. Ved succes:
-   - ordren oprettes med `paymentStatus: "PAID"`
-5. Ved fejl (efter timeout, retry og evt. circuit breaker):
-   - ordren oprettes stadig, men med `paymentStatus: "PENDING_PAYMENT"` og `payment: null` (fallback)
-
-**Endpoints:**
-
-- `GET /health` – health-check for order-service.
-- `POST /orders`
-
-  Request-body:
-
-  ```json
-  {
-    "productId": 1
-  }
-  ```
-
-  Eksempel når betaling lykkes:
-
-  ```json
-  {
-    "id": "order-1733740000000",
-    "product": {
-      "id": 1,
-      "name": "Laptop",
-      "price": 9999
-    },
-    "paymentStatus": "PAID",
-    "payment": {
-      "status": "success",
-      "transactionId": "tx-1733740000000",
-      "orderId": "order-1733740000000",
-      "amount": 9999
-    }
-  }
-  ```
-
-  Eksempel når betaling _ikke_ lykkes efter forsøg (fallback):
-
-  ```json
-  {
-    "id": "order-1733740000001",
-    "product": {
-      "id": 1,
-      "name": "Laptop",
-      "price": 9999
-    },
-    "paymentStatus": "PENDING_PAYMENT",
-    "payment": null
-  }
-  ```
-
-- `GET /orders` – returnerer en in-memory liste over alle ordrer.
-
-**Intern struktur (uddrag):**
-
-- `clients/productClient.js` – HTTP-klient til `product-service`
-- `clients/paymentClient.js` – resilient HTTP-klient til `payment-service`
-- `services/order.service.js` – domænelogik for ordrer (inkl. fallback)
-- `controllers/order.controller.js` – HTTP-lag for `/orders`
-- `routes/order.routes.js` + `routes/index.js`
-- `docs/swagger.js` – Swagger/OpenAPI-definition
-- `app.js` – Express + JSON-middleware + Swagger UI
-- `index.js` – starter HTTP-serveren
+**Port (default):** `4000`
 
 ---
 
-## 3. Resilience patterns i `order-service`
+#### 3.1 Konfiguration (resilience)
 
-Den vigtigste del af projektet ift. eksamen er implementeringen af **resilience patterns** i:
-
-- `order-service/src/config/config.js`
-- `order-service/src/clients/paymentClient.js`
-- `order-service/src/services/order.service.js`
-
-### 3.1 Konfiguration (`config/config.js`)
-
-`config.js` samler alle centrale indstillinger, inkl. resilience-parametre:
+Fil: `order-service/src/config/config.js`
 
 ```js
 export const config = {
@@ -253,21 +229,12 @@ export const config = {
       process.env.PAYMENT_SERVICE_URL || "http://127.0.0.1:4002",
   },
   resilience: {
-    // TIMEOUT: hvor længe vi max venter på payment-service pr. kald (ms)
     paymentTimeoutMs: Number(process.env.PAYMENT_TIMEOUT_MS || 2000),
-
-    // RETRY: hvor mange gange vi max prøver
     paymentMaxRetries: Number(process.env.PAYMENT_MAX_RETRIES || 3),
-
-    // RETRY: hvor længe vi venter mellem forsøg (ms)
     paymentRetryDelayMs: Number(process.env.PAYMENT_RETRY_DELAY_MS || 500),
-
-    // CIRCUIT BREAKER: hvor mange fejl før vi "åbner" kredsløbet
     circuitBreakerFailureThreshold: Number(
       process.env.PAYMENT_CB_FAILURE_THRESHOLD || 3
     ),
-
-    // CIRCUIT BREAKER: hvor længe vi holder kredsløbet åbent (ms)
     circuitBreakerOpenStateMs: Number(
       process.env.PAYMENT_CB_OPEN_STATE_MS || 10000
     ),
@@ -275,176 +242,110 @@ export const config = {
 };
 ```
 
-Det gør systemet konfigurerbart: samme kode kan opføre sig forskelligt i dev/produktion bare ved at ændre environment-variabler.
+Det betyder, at jeg kan tweake adfærden via environment variables – fx hvor hurtigt circuit breaker skal åbne, hvor lang timeout der skal være, osv.
 
 ---
 
-### 3.2 Timeout, retry og circuit breaker (`clients/paymentClient.js`)
+#### 3.2 Resilient payment client
 
-`paymentClient.js` er en **resilient HTTP-klient** til `payment-service`.
+Fil: `order-service/src/clients/paymentClient.js`
 
-Vigtigste idéer:
+Her har jeg samlet tre patterns:
 
-- **Timeout** beskytter mod langsomme kald
-- **Retry** forsøger at “absorbere” midlertidige fejl
-- **Circuit breaker** beskytter systemet mod at blive ved med at kalde en ustabil service
-- **Fejlklassificering** (retryable vs. non-retryable)
+1. **Timeout** – via Axios’ `timeout`-option:
 
-Forenklet uddrag:
+   ```js
+   const response = await axios.post(url, body, {
+     timeout: paymentTimeoutMs,
+   });
+   ```
+
+2. **Retry** – jeg prøver op til `paymentMaxRetries` gange ved _retryable_ fejl:
+
+   - Timeout (`ECONNABORTED`)
+   - Netværksfejl (ingen statuskode, fx `ECONNREFUSED`)
+   - 5xx-fejl fra payment-service
+
+   Jeg har en helper:
+
+   ```js
+   function isRetryableError(err) {
+     const status = err.response && err.response.status;
+     const isTimeout = err.code === "ECONNABORTED";
+     const isNetworkError = !status && !isTimeout;
+
+     if (status && status >= 400 && status < 500) {
+       return false;
+     }
+     return isTimeout || isNetworkError || (status && status >= 500);
+   }
+   ```
+
+   Ved retryable fejl logger jeg, markere failure i circuit breaker og venter `paymentRetryDelayMs` ms før næste forsøg.
+
+3. **Circuit Breaker** – et simpelt in-memory circuit breaker state:
+
+   ```js
+   const circuitState = {
+     state: "CLOSED", // "CLOSED" | "OPEN" | "HALF_OPEN"
+     failureCount: 0,
+     nextTryAfter: 0,
+   };
+   ```
+
+   Logikken:
+
+   - **CLOSED**: normale kald, failureCount tælles op ved fejl
+   - Når `failureCount >= circuitBreakerFailureThreshold` → **OPEN**
+     - I OPEN bliver alle kald afvist indtil `nextTryAfter` (baseret på `circuitBreakerOpenStateMs`)
+   - Når tiden er gået, går vi i **HALF_OPEN** og tillader et “test-kald”
+     - Ved succes: reset → CLOSED
+     - Ved fejl: tilbage til OPEN
+
+   Hele den logik er samlet i helpers:
+
+   - `ensureCircuitAllowsRequest()`
+   - `markSuccess()`
+   - `markFailure()`
+
+Selve entrypoint-funktionen er:
 
 ```js
-import axios from "axios";
-import { config } from "../config/config.js";
+export async function createPaymentWithResilience({ orderId, amount }) { ... }
+```
 
-const { paymentServiceUrl } = config.services;
-const {
-  paymentTimeoutMs,
-  paymentMaxRetries,
-  paymentRetryDelayMs,
-  circuitBreakerFailureThreshold,
-  circuitBreakerOpenStateMs,
-} = config.resilience;
+Hvis alle forsøg fejler, kaster den en fejl, som håndteres som fallback i `order.service.js`.
 
-// In-memory circuit breaker state
-const circuitState = {
-  state: "CLOSED", // "CLOSED" | "OPEN" | "HALF_OPEN"
-  failureCount: 0,
-  nextTryAfter: 0,
-};
+---
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+#### 3.3 Product client
 
-function isRetryableError(err) {
-  const status = err.response && err.response.status;
-  const isTimeout = err.code === "ECONNABORTED";
-  const isNetworkError = !status && !isTimeout; // fx ECONNREFUSED
+Fil: `order-service/src/clients/productClient.js`
 
-  // 4xx fejl er typisk klient-fejl → retry giver ingen mening
-  if (status && status >= 400 && status < 500) return false;
+Simpel HTTP-klient til product-service:
 
-  return isTimeout || isNetworkError || (status && status >= 500);
-}
-
-function markSuccess() {
-  if (circuitState.state !== "CLOSED" || circuitState.failureCount > 0) {
-    console.log("[order-service] Circuit breaker RESET for payment-service");
-  }
-  circuitState.state = "CLOSED";
-  circuitState.failureCount = 0;
-  circuitState.nextTryAfter = 0;
-}
-
-function markFailure() {
-  circuitState.failureCount += 1;
-  if (circuitState.failureCount >= circuitBreakerFailureThreshold) {
-    circuitState.state = "OPEN";
-    circuitState.nextTryAfter = Date.now() + circuitBreakerOpenStateMs;
-    console.warn("[order-service] Circuit breaker OPEN for payment-service...");
-  }
-}
-
-function ensureCircuitAllowsRequest() {
-  const now = Date.now();
-
-  if (circuitState.state === "OPEN") {
-    if (now >= circuitState.nextTryAfter) {
-      console.warn(
-        "[order-service] Circuit breaker HALF_OPEN for payment-service..."
-      );
-      circuitState.state = "HALF_OPEN";
-      return;
-    }
-
-    const error = new Error("Circuit breaker is OPEN for payment-service");
-    error.code = "CIRCUIT_OPEN";
-    throw error;
-  }
-}
-
-export async function createPaymentWithResilience({ orderId, amount }) {
-  const url = paymentServiceUrl + "/payments";
-  const body = { amount, orderId };
-  let lastError;
-
-  for (let attempt = 1; attempt <= paymentMaxRetries; attempt++) {
-    ensureCircuitAllowsRequest();
-
-    try {
-      console.log(
-        "[order-service] Payment attempt",
-        attempt,
-        "for order",
-        orderId
-      );
-
-      const response = await axios.post(url, body, {
-        timeout: paymentTimeoutMs, // TIMEOUT
-      });
-
-      markSuccess(); // reset circuit ved success
-      return response.data;
-    } catch (err) {
-      lastError = err;
-
-      if (!isRetryableError(err)) {
-        markFailure();
-        throw err;
-      }
-
-      markFailure();
-
-      console.warn(
-        "[order-service] Retryable payment error on attempt",
-        attempt,
-        {
-          status: err.response && err.response.status,
-          code: err.code,
-          message: err.message,
-        }
-      );
-
-      if (attempt < paymentMaxRetries) {
-        console.log(
-          "[order-service] Waiting",
-          paymentRetryDelayMs,
-          "ms before next payment retry..."
-        );
-        await sleep(paymentRetryDelayMs);
-      }
-    }
-  }
-
-  console.error(
-    "[order-service] Max payment retries reached for order",
-    orderId
-  );
-  throw lastError || new Error("Payment failed after retries");
+```js
+export async function getProductById(productId) {
+  const url = `${config.services.productServiceUrl}/products/${productId}`;
+  const response = await axios.get(url);
+  return response.data;
 }
 ```
 
-**Hvordan det ser ud i praksis (fx i Docker-logs):**
-
-- Flere `Payment attempt X for order Y` med samme `orderId`
-- Timeouts (`timeout of 2000ms exceeded`)
-- 500-fejl (`Request failed with status code 500`)
-- `Circuit breaker OPEN ...` og senere `Circuit breaker RESET ...`
-
-Det er direkte evidens for, at dine resilience patterns er aktive.
-
 ---
 
-### 3.3 Fallback i domænelaget (`services/order.service.js`)
+#### 3.4 Domænelogik – Order service
 
-Selvom `createPaymentWithResilience` kan kaste fejl, så håndterer domænelaget dem ved at lave en **graceful fallback**:
+Fil: `order-service/src/services/order.service.js`
+
+Denne fil implementerer det samlede business-flow for at oprette en ordre:
+
+1. Hent produktet fra **product-service**
+2. Forsøg betaling mod **payment-service** med resilience
+3. Fallback, hvis betaling fejler
+4. Gem ordren i en in-memory liste
 
 ```js
-import { getProductById } from "../clients/productClient.js";
-import { createPaymentWithResilience } from "../clients/paymentClient.js";
-
-const orders = [];
-
 export async function createOrder({ productId }) {
   const product = await getProductById(productId);
   const orderId = `order-${Date.now()}`;
@@ -476,212 +377,263 @@ export async function createOrder({ productId }) {
   orders.push(order);
   return order;
 }
-
-export function listOrders() {
-  return orders;
-}
 ```
 
-I stedet for at systemet bryder helt sammen, bliver ordren oprettet med en status, der afspejler, at betalingen ikke er gennemført endnu. Det er et konkret eksempel på **fallback pattern** / **graceful degradation**.
+**Vigtigt fagligt point:**  
+Selv hvis betaling fejler (pga. timeout, 500-fejl, circuit open osv.), opretter jeg stadig ordren, men markerer den som `PENDING_PAYMENT`. Det er et eksempel på **Graceful Degradation / Fallback**, hvor systemet stadig kan håndtere ordren og f.eks. senere forsøge betaling igen.
 
 ---
 
-## 4. API-dokumentation med Swagger (`order-service`)
+#### 3.5 Controllers og routes
 
-`order-service` har tilføjet **Swagger/OpenAPI** dokumentation.
+- `src/controllers/order.controller.js`
 
-- Definition: `order-service/src/docs/swagger.js`
-- Swagger UI mountet i `order-service/src/app.js`:
+  - `createOrderHandler`
+    - Validerer `productId` i body
+    - Kalder `createOrder` og returnerer `201` ved succes
+  - `listOrdersHandler`
+    - Returnerer alle oprettede ordrer (in-memory)
 
-```js
-import swaggerUi from "swagger-ui-express";
-import { swaggerDocument } from "./docs/swagger.js";
+- `src/routes/order.routes.js`
 
-export function createApp() {
-  const app = express();
+  - `POST /orders` → opret ordre
+  - `GET /orders` → hent alle ordrer
 
-  app.use(express.json());
+- `src/routes/index.js`
+  - `GET /health` → health-check
+  - Mount’er `orderRouter` på `/orders`
 
-  // Swagger UI på /docs
-  app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerDocument));
+---
 
-  registerRoutes(app);
-  return app;
-}
-```
+#### 3.6 Swagger-dokumentation
 
-Når `order-service` kører (lokalt eller i Docker), kan Swagger UI åbnes på:
+Fil: `order-service/src/docs/swagger.js`
 
-- `http://localhost:4000/docs`
+Her har jeg defineret en simpel OpenAPI-spec for order-service, som udstilles via Swagger UI:
 
-Her kan man se og teste bl.a.:
+- Swagger UI er tilgængelig på:  
+  `GET http://localhost:4000/docs`
+
+Swagger dokumenterer bl.a.:
 
 - `GET /health`
 - `GET /orders`
 - `POST /orders`
-- Schemas for `Product`, `Order`, `Payment`, `CreateOrderRequest`
 
-Swagger-delen demonstrerer **API-dokumentation**, som er en eksplicit del af læringsmålene i faget.
+Med følgende schemas:
 
----
-
-## 5. Deployment med Docker og docker-compose
-
-Alle tre services er containeriseret og kan startes samlet via `docker-compose`.
-
-### 5.1 Dockerfiles (kort)
-
-Eksempel – `order-service/Dockerfile`:
-
-```dockerfile
-FROM node:18-alpine
-
-WORKDIR /usr/src/app
-
-COPY package*.json ./
-RUN npm install --only=production
-
-COPY src ./src
-
-EXPOSE 4000
-
-CMD ["node", "src/index.js"]
-```
-
-Tilsvarende findes Dockerfiles i:
-
-- `product-service/Dockerfile` (port 4001)
-- `payment-service/Dockerfile` (port 4002)
-
-### 5.2 docker-compose.yml
-
-I roden af projektet ligger `docker-compose.yml`, fx:
-
-```yaml
-version: "3.9"
-
-services:
-  product-service:
-    build: ./product-service
-    container_name: product-service
-    ports:
-      - "4001:4001"
-    environment:
-      PORT: 4001
-
-  payment-service:
-    build: ./payment-service
-    container_name: payment-service
-    ports:
-      - "4002:4002"
-    environment:
-      PORT: 4002
-
-  order-service:
-    build: ./order-service
-    container_name: order-service
-    ports:
-      - "4000:4000"
-    environment:
-      PORT: 4000
-      PRODUCT_SERVICE_URL: http://product-service:4001
-      PAYMENT_SERVICE_URL: http://payment-service:4002
-      PAYMENT_TIMEOUT_MS: 2000
-      PAYMENT_MAX_RETRIES: 3
-      PAYMENT_RETRY_DELAY_MS: 500
-    depends_on:
-      - product-service
-      - payment-service
-```
-
-Bemærk, at `order-service` i Docker **ikke** kalder `127.0.0.1`, men i stedet de andre services via deres **service-navne i Docker-netværket**:
-
-- `http://product-service:4001`
-- `http://payment-service:4002`
-
-Environment-variablerne overskriver standard-URLs i `config.js`.
-
-### 5.3 Kørsel med Docker
-
-Fra projektets rod:
-
-```bash
-docker compose up --build
-```
-
-Herefter er systemet tilgængeligt fra værtsmaskinen:
-
-- `http://localhost:4001/health` (product-service)
-- `http://localhost:4002/health` (payment-service)
-- `http://localhost:4000/health` (order-service)
-- `http://localhost:4000/orders`
-- `http://localhost:4000/docs` (Swagger UI)
+- `CreateOrderRequest` – input body (indeholder `productId`)
+- `Product` – produktstruktur
+- `Payment` – payment-respons (nullable)
+- `Order` – samlet ordre (id, product, paymentStatus, payment)
 
 ---
 
-## 6. Kørsel uden Docker (ren Node.js)
+## Endpoints – samlet overblik
 
-Alternativt kan hver service køres direkte med Node.
+### product-service (port 4001)
 
-### 6.1 product-service
+- `GET /health`
+- `GET /products`
+- `GET /products/:id`
 
-```bash
-cd product-service
-npm install
-node src/index.js
-# -> product-service running on port 4001
-```
+### payment-service (port 4002)
 
-### 6.2 payment-service
+- `GET /health`
+- `POST /payments`
 
-```bash
-cd payment-service
-npm install
-node src/index.js
-# -> payment-service running on port 4002
-```
+### order-service (port 4000)
 
-### 6.3 order-service
-
-```bash
-cd order-service
-npm install
-node src/index.js
-# -> order-service running on port 4000
-```
-
-Derefter kan endpoints rammes på samme URL’er som ovenfor (`localhost:4000`, `4001`, `4002`).
+- `GET /health`
+- `GET /orders`
+- `POST /orders`
+- `GET /docs` (Swagger UI)
 
 ---
 
-## 7. Sammenhæng til faget “System Integration”
+## Kørsel af systemet
 
-Projektet understøtter flere centrale fokuspunkter fra kurset:
+### Forudsætninger
 
-- **Service scoping & bounded context**  
-  Hver service har et klart domæne:
+- Docker
+- Docker Compose  
+  _(Alternativt kan services også startes manuelt med Node.js 18+, se længere nede)_
 
-  - `product-service`: produktkatalog
-  - `payment-service`: betaling
-  - `order-service`: ordrer + orkestrering
+### Start med docker-compose
 
-- **Service design & architecture**  
-  Lagdelt struktur (config, routes, controllers, services, clients), tydelig separering af ansvar, samt en orkestrerende service (`order-service`), der styrer kald mellem bounded contexts.
+Fra roden af projektet:
 
-- **Communication using REST**  
-  Al kommunikation mellem services foregår via HTTP/REST + JSON, hvilket illustrerer klassisk synkron service-integration.
+```bash
+docker-compose up --build
+```
 
-- **Resilience patterns**
+Dette vil:
 
-  - **Timeout** (beskytter mod langsomme eller hængende kald)
-  - **Retry** (absorberer midlertidige fejl)
-  - **Circuit breaker** (beskytter mod ustabile downstream-services)
-  - **Fallback** (ordrer oprettes som `PENDING_PAYMENT` i stedet for at fejle hårdt)
+- bygge og starte:
+  - `product-service` på port `4001`
+  - `payment-service` på port `4002`
+  - `order-service` på port `4000`
+- konfigurere `order-service`, så den kalder de andre services via:
+  - `PRODUCT_SERVICE_URL=http://product-service:4001`
+  - `PAYMENT_SERVICE_URL=http://payment-service:4002`
 
-- **Documentation of APIs using Swagger**  
-  Swagger/OpenAPI på `order-service`, eksponeret via `/docs`.
+### Test af endpoints
 
-- **Deployment using Docker**  
-  Hver service har en Dockerfile, og hele systemet kan startes samlet med `docker-compose`. Det afspejler en realistisk måde at drifte microservices på i praksis.
+1. **Tjek health på alle services**
 
-Projektet kan dermed bruges som en **konkret case** i eksamen, hvor du både kan diskutere teori (patterns, arkitektur, integration) og samtidig vise konkret kode og kørende system.
+   ```bash
+   curl http://localhost:4001/health
+   curl http://localhost:4002/health
+   curl http://localhost:4000/health
+   ```
+
+2. **Hent produkter**
+
+   ```bash
+   curl http://localhost:4001/products
+   ```
+
+3. **Opret en ordre**
+
+   ```bash
+   curl -X POST http://localhost:4000/orders      -H "Content-Type: application/json"      -d '{"productId": 1}'
+   ```
+
+   Mulige scenarier:
+
+   - Betaling lykkes:
+
+     ```json
+     {
+       "id": "order-1765392289557",
+       "product": { "id": 1, "name": "Laptop", "price": 9999 },
+       "paymentStatus": "PAID",
+       "payment": {
+         "status": "success",
+         "transactionId": "tx-1765392292595",
+         "orderId": "order-1765392289557",
+         "amount": 9999
+       }
+     }
+     ```
+
+   - Betaling fejler (timeout/500/circuit open), men ordre oprettes:
+     ```json
+     {
+       "id": "order-1765392289557",
+       "product": { "id": 1, "name": "Laptop", "price": 9999 },
+       "paymentStatus": "PENDING_PAYMENT",
+       "payment": null
+     }
+     ```
+
+4. **Se alle ordrer**
+   ```bash
+   curl http://localhost:4000/orders
+   ```
+
+---
+
+## Kørsel uden Docker (lokalt)
+
+Hvis jeg vil køre det hele direkte via Node:
+
+1. Installer dependencies i hver service-mappe:
+
+   ```bash
+   cd product-service && npm install
+   cd ../payment-service && npm install
+   cd ../order-service && npm install
+   ```
+
+2. Start services (i hver sin terminal):
+
+   ```bash
+   # product-service
+   cd product-service
+   npm start
+
+   # payment-service
+   cd payment-service
+   npm start
+
+   # order-service
+   cd order-service
+   npm start
+   ```
+
+3. I lokal udvikling bruger order-service default URLs:
+
+   - `http://127.0.0.1:4001` (product-service)
+   - `http://127.0.0.1:4002` (payment-service)
+
+   Det kan overskrives med env-variabler:
+
+   ```bash
+   export PRODUCT_SERVICE_URL=http://localhost:4001
+   export PAYMENT_SERVICE_URL=http://localhost:4002
+   ```
+
+---
+
+## Resilience – hvordan man kan demonstrere det
+
+For at demonstrere resilience patterns i praksis kan jeg:
+
+1. **Spamme /orders** med requests (fx via Postman eller et lille script).
+2. Observere logs i **order-service** og **payment-service**:
+
+   - `[payment-service] Simulating slow response...`
+   - `[payment-service] Simulating 500 error`
+   - `[order-service] Retryable payment error on attempt ...`
+   - `[order-service] Circuit breaker OPEN for payment-service...`
+   - `[order-service] Circuit breaker HALF_OPEN for payment-service...`
+   - `[order-service] Payment failed, marking order as PENDING_PAYMENT`
+
+3. Justere konfiguration via env-variabler i `docker-compose.yml`, fx:
+   ```yaml
+   PAYMENT_TIMEOUT_MS: 2000
+   PAYMENT_MAX_RETRIES: 3
+   PAYMENT_RETRY_DELAY_MS: 500
+   PAYMENT_CB_FAILURE_THRESHOLD: 3
+   PAYMENT_CB_OPEN_STATE_MS: 10000
+   ```
+
+På den måde kan jeg tydeligt vise forskellen på:
+
+- **Uden resilience**: hver fejl vil potentielt blokere brugeroplevelsen
+- **Med resilience**: systemet fejler mere kontrolleret, og ordrer kan stadig oprettes som `PENDING_PAYMENT`, selv når payment-service er ustabil
+
+---
+
+## Designovervejelser og videre arbejde
+
+**Bevidste valg:**
+
+- Jeg har valgt **simpel in-memory-lagring** for ordrer og produkter for at holde fokus på integration og resilience fremfor databaseteknik.
+- Jeg har holdt services **små og fokuserede**:
+  - product-service: kun produkter
+  - payment-service: kun betaling
+  - order-service: orkestrering og resilience
+- Konfiguration via **environment variables** gør det nemt at tweake adfærd uden kodeændringer.
+
+**Mulige forbedringer:**
+
+- Tilføje en rigtig database til ordrer og produkter
+- Implementere et asynkront “re-try payment later”-flow for `PENDING_PAYMENT` via f.eks. message queue
+- Metrics og monitoring (Prometheus/Grafana, logging til ELK-stack, etc.)
+- Distribueret circuit breaker og centraliseret configuration (fx via et config center)
+- Flere testcases og automatiske tests
+
+---
+
+## Opsummering
+
+Projektet demonstrerer en lille, men realistisk microservice-arkitektur, hvor jeg især viser:
+
+- Hvordan services kan **kommunikere via HTTP/REST**
+- Hvordan man kan implementere **Timeout, Retry og Circuit Breaker** i en klient (order-service → payment-service)
+- Hvordan man kan arbejde med **Graceful Degradation**, så ordrer stadig oprettes, selv når betaling fejler
+- Hvordan **Docker** og **docker-compose** kan bruges til at køre flere services samlet
+
+Det gør projektet velegnet som et praktisk eksempel på systemintegration og resilience patterns i en moderne microservice-kontekst.
